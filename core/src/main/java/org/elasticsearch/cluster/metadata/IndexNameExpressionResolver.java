@@ -19,13 +19,17 @@
 
 package org.elasticsearch.cluster.metadata;
 
+import com.carrotsearch.hppc.cursors.ObjectCursor;
+import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
 import com.google.common.base.Predicate;
+import com.google.common.collect.Sets;
 import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.action.IndicesRequest;
 import org.elasticsearch.action.support.IndicesOptions;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.Strings;
+import org.elasticsearch.common.collect.ImmutableOpenMap;
 import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.component.AbstractComponent;
 import org.elasticsearch.common.inject.Inject;
@@ -44,12 +48,15 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentSkipListMap;
 
 import static com.google.common.collect.Maps.filterEntries;
 import static com.google.common.collect.Maps.newHashMap;
@@ -59,6 +66,12 @@ public class IndexNameExpressionResolver extends AbstractComponent {
     private final List<ExpressionResolver> expressionResolvers;
     private final DateMathExpressionResolver dateMathExpressionResolver;
 
+    private static SortedMap<String, AliasOrIndex> aliasOrIndexMap = new ConcurrentSkipListMap<>();
+    private static ImmutableOpenMap<String, IndexMetaData> indicesCurrent = ImmutableOpenMap.<String, IndexMetaData>builder().build();
+    private static String[] allIndices;
+    private static String[] allOpenIndices;
+    private static String[] allClosedIndices;
+
     @Inject
     public IndexNameExpressionResolver(Settings settings) {
         super(settings);
@@ -66,6 +79,153 @@ public class IndexNameExpressionResolver extends AbstractComponent {
                 dateMathExpressionResolver = new DateMathExpressionResolver(settings),
                 new WildcardExpressionResolver()
         );
+    }
+
+    static class MetaDataBits {
+        private final SortedMap<String, AliasOrIndex> aliasOrIndexMap;
+        private final String[] allIndices;
+        private final String[] allOpenIndices;
+        private final String[] allClosedIndices;
+
+        MetaDataBits(SortedMap<String, AliasOrIndex> aliasOrIndexMap, String[] allIndices, String[] allOpenIndices, String[] allClosedIndices) {
+            this.aliasOrIndexMap = aliasOrIndexMap;
+            this.allIndices = allIndices;
+            this.allOpenIndices = allOpenIndices;
+            this.allClosedIndices = allClosedIndices;
+        }
+
+        SortedMap<String, AliasOrIndex> getAliasOrIndexMap() {
+            return this.aliasOrIndexMap;
+        }
+
+        String[] getAllIndices() {
+            return this.allIndices;
+        }
+
+        String[] getAllOpenIndices() {
+            return this.allOpenIndices;
+        }
+
+        String[] getAllClosedIndices() {
+            return this.allClosedIndices;
+        }
+    }
+
+    static MetaDataBits updateAndGetAliasOrIndexMap(ImmutableOpenMap<String, IndexMetaData> indices) {
+        ImmutableOpenMap.Builder<String, IndexMetaData> indicesDeltaBuilder = ImmutableOpenMap.builder();
+        for (ObjectObjectCursor<String, IndexMetaData> newIndexMetaData : indices) {
+            if (!indicesCurrent.containsKey(newIndexMetaData.key) || !indicesCurrent.get(newIndexMetaData.key).equals(newIndexMetaData.value)) {
+                indicesDeltaBuilder.put(newIndexMetaData.key, newIndexMetaData.value);
+            }
+        }
+            List<String> removals = new ArrayList<>();
+        for (ObjectObjectCursor<String, IndexMetaData> currentIndexMetaData : indicesCurrent) {
+            if (!indices.containsKey(currentIndexMetaData.key)) {
+                    removals.add(currentIndexMetaData.key);
+            }
+        }
+
+        ImmutableOpenMap<String, IndexMetaData> indicesDelta = indicesDeltaBuilder.build();
+        indicesCurrent = indices; // next delta always based on new input
+
+        // no differences found, so skip basically everything
+        if (!indicesDelta.isEmpty()) {
+
+            // TODO: We should move these datastructures to IndexNameExpressionResolver, this will give the following benefits:
+            // 1) The datastructures will only be rebuilded when needed. Now during serailizing we rebuild these datastructures
+            //    while these datastructures aren't even used.
+            // 2) The aliasAndIndexLookup can be updated instead of rebuilding it all the time.
+
+            // build all concrete indices arrays:
+            // TODO: I think we can remove these arrays. it isn't worth the effort, for operations on all indices.
+            // When doing an operation across all indices, most of the time is spent on actually going to all shards and
+            // do the required operations, the bottleneck isn't resolving expressions into concrete indices.
+            List<String> allIndicesLst = new ArrayList<>();
+            List<String> allOpenIndicesLst = new ArrayList<>();
+            List<String> allClosedIndicesLst = new ArrayList<>();
+
+            // build all indices map
+            Map<String, AliasOrIndex> aliasAndIndexLookupTmp = new HashMap<>();
+            for (ObjectCursor<IndexMetaData> cursor : indicesDelta.values()) {
+                IndexMetaData indexMetaData = cursor.value;
+
+                allIndicesLst.add(indexMetaData.getIndex());
+                if (indexMetaData.getState() == IndexMetaData.State.OPEN) {
+                    allOpenIndicesLst.add(indexMetaData.getIndex());
+                } else if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
+                    allClosedIndicesLst.add(indexMetaData.getIndex());
+                }
+
+                aliasAndIndexLookupTmp.put(indexMetaData.getIndex(), new AliasOrIndex.Index(indexMetaData));
+
+                for (ObjectObjectCursor<String, AliasMetaData> aliasCursor : indexMetaData.getAliases()) {
+                    AliasMetaData aliasMetaData = aliasCursor.value;
+                    AliasOrIndex aliasOrIndex = aliasAndIndexLookupTmp.get(aliasMetaData.getAlias());
+                    if (aliasOrIndex == null) {
+                        aliasOrIndex = new AliasOrIndex.Alias(aliasMetaData, indexMetaData);
+                        aliasAndIndexLookupTmp.put(aliasMetaData.getAlias(), aliasOrIndex);
+                    } else if (aliasOrIndex instanceof AliasOrIndex.Alias) {
+                        AliasOrIndex.Alias alias = (AliasOrIndex.Alias) aliasOrIndex;
+                        alias.addIndex(indexMetaData);
+                    } else if (aliasOrIndex instanceof AliasOrIndex.Index) {
+                        AliasOrIndex.Index index = (AliasOrIndex.Index) aliasOrIndex;
+                        throw new IllegalStateException("index and alias names need to be unique, but alias [" + aliasMetaData.getAlias() + "] and index [" + index.getIndex().getIndex() + "] have the same name");
+                    } else {
+                        throw new IllegalStateException("unexpected alias [" + aliasMetaData.getAlias() + "][" + aliasOrIndex + "]");
+                    }
+                }
+            }
+            allIndices = allIndicesLst.toArray(new String[allIndicesLst.size()]);
+            allOpenIndices = allOpenIndicesLst.toArray(new String[allOpenIndicesLst.size()]);
+            allClosedIndices = allClosedIndicesLst.toArray(new String[allClosedIndicesLst.size()]);
+//        for(Map.Entry<String, MapDifference.ValueDifference<AliasOrIndex>> difference: Maps.difference(aliasOrIndexMap, aliasAndIndexLookupTmp).entriesDiffering().entrySet()) {
+//            AliasOrIndex updatedValue = difference.getValue().rightValue();
+//            if (updatedValue == null) {
+//                aliasOrIndexMap.remove(difference.getKey());
+//            } else {
+//                aliasOrIndexMap.put(difference.getKey(), updatedValue);
+//            }
+//        }
+
+            // wat
+            if (!aliasAndIndexLookupTmp.equals(aliasOrIndexMap)) {
+                for(Map.Entry<String, AliasOrIndex> aliasAndIndexUpdate : aliasAndIndexLookupTmp.entrySet()) {
+                    // TODO: can we make this even smarter by checking whether an update is "real" or not?
+                    aliasOrIndexMap.put(aliasAndIndexUpdate.getKey(), aliasAndIndexUpdate.getValue());
+                }
+                Set<String> missing = Sets.difference(aliasOrIndexMap.keySet(), aliasAndIndexLookupTmp.keySet());
+                for(String toRemove : missing) {
+                    aliasOrIndexMap.remove(toRemove);
+                }
+            }
+
+//            SortedMap<String, AliasOrIndex> aliasOrIndexMapSorted = new TreeMap<>(aliasOrIndexMap);
+
+            return new MetaDataBits(Collections.unmodifiableSortedMap(aliasOrIndexMap), allIndices, allOpenIndices, allClosedIndices);
+        } else {
+            List<String> allIndicesLst = new ArrayList<>();
+            List<String> allOpenIndicesLst = new ArrayList<>();
+            List<String> allClosedIndicesLst = new ArrayList<>();
+            for (ObjectCursor<IndexMetaData> cursor : indicesDelta.values()) {
+                IndexMetaData indexMetaData = cursor.value;
+
+                allIndicesLst.add(indexMetaData.getIndex());
+                if (indexMetaData.getState() == IndexMetaData.State.OPEN) {
+                    allOpenIndicesLst.add(indexMetaData.getIndex());
+                } else if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
+                    allClosedIndicesLst.add(indexMetaData.getIndex());
+                }
+            }
+            allIndices = allIndicesLst.toArray(new String[allIndicesLst.size()]);
+            allOpenIndices = allOpenIndicesLst.toArray(new String[allOpenIndicesLst.size()]);
+            allClosedIndices = allClosedIndicesLst.toArray(new String[allClosedIndicesLst.size()]);
+
+            for(String removal : removals) {
+                aliasOrIndexMap.remove(removal);
+            }
+
+            return new MetaDataBits(Collections.unmodifiableSortedMap(aliasOrIndexMap), allIndices, allOpenIndices, allClosedIndices);
+        }
     }
 
     /**
