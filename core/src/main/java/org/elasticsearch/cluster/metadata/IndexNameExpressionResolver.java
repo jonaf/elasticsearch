@@ -22,7 +22,6 @@ package org.elasticsearch.cluster.metadata;
 import com.carrotsearch.hppc.cursors.ObjectCursor;
 import com.carrotsearch.hppc.cursors.ObjectObjectCursor;
 import com.google.common.base.Predicate;
-import com.google.common.collect.Sets;
 import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.action.IndicesRequest;
 import org.elasticsearch.action.support.IndicesOptions;
@@ -66,11 +65,12 @@ public class IndexNameExpressionResolver extends AbstractComponent {
     private final List<ExpressionResolver> expressionResolvers;
     private final DateMathExpressionResolver dateMathExpressionResolver;
 
-    private static SortedMap<String, AliasOrIndex> aliasOrIndexMap = new ConcurrentSkipListMap<>();
-    private static ImmutableOpenMap<String, IndexMetaData> indicesCurrent = ImmutableOpenMap.<String, IndexMetaData>builder().build();
+    private static volatile SortedMap<String, AliasOrIndex> aliasOrIndexMap = new ConcurrentSkipListMap<>();
+    private static volatile ImmutableOpenMap<String, IndexMetaData> indicesCurrent = ImmutableOpenMap.<String, IndexMetaData>builder().build();
     private static String[] allIndices;
     private static String[] allOpenIndices;
     private static String[] allClosedIndices;
+    static final Object lock = new Object();
 
     @Inject
     public IndexNameExpressionResolver(Settings settings) {
@@ -112,41 +112,34 @@ public class IndexNameExpressionResolver extends AbstractComponent {
     }
 
     static MetaDataBits updateAndGetAliasOrIndexMap(ImmutableOpenMap<String, IndexMetaData> indices) {
-        ImmutableOpenMap.Builder<String, IndexMetaData> indicesDeltaBuilder = ImmutableOpenMap.builder();
-        for (ObjectObjectCursor<String, IndexMetaData> newIndexMetaData : indices) {
-            if (!indicesCurrent.containsKey(newIndexMetaData.key) || !indicesCurrent.get(newIndexMetaData.key).equals(newIndexMetaData.value)) {
-                indicesDeltaBuilder.put(newIndexMetaData.key, newIndexMetaData.value);
+//        synchronized (lock) {
+//        System.out.println("-----------------------------");
+//        System.out.println("indices[" + indices.toString() + "]; current[" + indicesCurrent.toString() + "]");
+            ImmutableOpenMap.Builder<String, IndexMetaData> indicesDeltaBuilder = ImmutableOpenMap.builder();
+            for (ObjectObjectCursor<String, IndexMetaData> newIndexMetaData : indices) {
+                if (!indicesCurrent.containsKey(newIndexMetaData.key) || !indicesCurrent.get(newIndexMetaData.key).equals(newIndexMetaData.value)) {
+                    indicesDeltaBuilder.put(newIndexMetaData.key, newIndexMetaData.value);
+                }
             }
-        }
-            List<String> removals = new ArrayList<>();
-        for (ObjectObjectCursor<String, IndexMetaData> currentIndexMetaData : indicesCurrent) {
-            if (!indices.containsKey(currentIndexMetaData.key)) {
-                    removals.add(currentIndexMetaData.key);
+            List<String> removals = null;
+            if (indicesCurrent.size() != indices.size()) {
+                removals = new ArrayList<>();
+                for (ObjectCursor<String> currentIndexMetaData : indicesCurrent.keys()) {
+                    if (!indices.containsKey(currentIndexMetaData.value)) {
+                        removals.add(currentIndexMetaData.value);
+                    }
+                }
             }
-        }
 
-        ImmutableOpenMap<String, IndexMetaData> indicesDelta = indicesDeltaBuilder.build();
-        indicesCurrent = indices; // next delta always based on new input
+            ImmutableOpenMap<String, IndexMetaData> indicesDelta = indicesDeltaBuilder.build();
+//            System.out.println("indices delta[" + indicesDelta + "]");
+            indicesCurrent = indices; // next delta always based on new input
 
-        // no differences found, so skip basically everything
-        if (!indicesDelta.isEmpty()) {
-
-            // TODO: We should move these datastructures to IndexNameExpressionResolver, this will give the following benefits:
-            // 1) The datastructures will only be rebuilded when needed. Now during serailizing we rebuild these datastructures
-            //    while these datastructures aren't even used.
-            // 2) The aliasAndIndexLookup can be updated instead of rebuilding it all the time.
-
-            // build all concrete indices arrays:
-            // TODO: I think we can remove these arrays. it isn't worth the effort, for operations on all indices.
-            // When doing an operation across all indices, most of the time is spent on actually going to all shards and
-            // do the required operations, the bottleneck isn't resolving expressions into concrete indices.
+            // Always rebuild the indices lists, at least for now... cheaper than converting to/from array and list
             List<String> allIndicesLst = new ArrayList<>();
             List<String> allOpenIndicesLst = new ArrayList<>();
             List<String> allClosedIndicesLst = new ArrayList<>();
-
-            // build all indices map
-            Map<String, AliasOrIndex> aliasAndIndexLookupTmp = new HashMap<>();
-            for (ObjectCursor<IndexMetaData> cursor : indicesDelta.values()) {
+            for (ObjectCursor<IndexMetaData> cursor : indices.values()) {
                 IndexMetaData indexMetaData = cursor.value;
 
                 allIndicesLst.add(indexMetaData.getIndex());
@@ -155,29 +148,43 @@ public class IndexNameExpressionResolver extends AbstractComponent {
                 } else if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
                     allClosedIndicesLst.add(indexMetaData.getIndex());
                 }
-
-                aliasAndIndexLookupTmp.put(indexMetaData.getIndex(), new AliasOrIndex.Index(indexMetaData));
-
-                for (ObjectObjectCursor<String, AliasMetaData> aliasCursor : indexMetaData.getAliases()) {
-                    AliasMetaData aliasMetaData = aliasCursor.value;
-                    AliasOrIndex aliasOrIndex = aliasAndIndexLookupTmp.get(aliasMetaData.getAlias());
-                    if (aliasOrIndex == null) {
-                        aliasOrIndex = new AliasOrIndex.Alias(aliasMetaData, indexMetaData);
-                        aliasAndIndexLookupTmp.put(aliasMetaData.getAlias(), aliasOrIndex);
-                    } else if (aliasOrIndex instanceof AliasOrIndex.Alias) {
-                        AliasOrIndex.Alias alias = (AliasOrIndex.Alias) aliasOrIndex;
-                        alias.addIndex(indexMetaData);
-                    } else if (aliasOrIndex instanceof AliasOrIndex.Index) {
-                        AliasOrIndex.Index index = (AliasOrIndex.Index) aliasOrIndex;
-                        throw new IllegalStateException("index and alias names need to be unique, but alias [" + aliasMetaData.getAlias() + "] and index [" + index.getIndex().getIndex() + "] have the same name");
-                    } else {
-                        throw new IllegalStateException("unexpected alias [" + aliasMetaData.getAlias() + "][" + aliasOrIndex + "]");
-                    }
-                }
             }
             allIndices = allIndicesLst.toArray(new String[allIndicesLst.size()]);
             allOpenIndices = allOpenIndicesLst.toArray(new String[allOpenIndicesLst.size()]);
             allClosedIndices = allClosedIndicesLst.toArray(new String[allClosedIndicesLst.size()]);
+
+            // no differences found, so skip basically everything
+            if (!indicesDelta.isEmpty()) {
+
+                // TODO: We should move these datastructures to IndexNameExpressionResolver, this will give the following benefits:
+                // 1) The datastructures will only be rebuilded when needed. Now during serailizing we rebuild these datastructures
+                //    while these datastructures aren't even used.
+                // 2) The aliasAndIndexLookup can be updated instead of rebuilding it all the time.
+
+                // build all indices map
+                Map<String, AliasOrIndex> aliasAndIndexLookupTmp = new HashMap<>();
+                for (ObjectCursor<IndexMetaData> cursor : indicesDelta.values()) {
+                    IndexMetaData indexMetaData = cursor.value;
+
+                    aliasAndIndexLookupTmp.put(indexMetaData.getIndex(), new AliasOrIndex.Index(indexMetaData));
+
+                    for (ObjectObjectCursor<String, AliasMetaData> aliasCursor : indexMetaData.getAliases()) {
+                        AliasMetaData aliasMetaData = aliasCursor.value;
+                        AliasOrIndex aliasOrIndex = aliasAndIndexLookupTmp.get(aliasMetaData.getAlias());
+                        if (aliasOrIndex == null) {
+                            aliasOrIndex = new AliasOrIndex.Alias(aliasMetaData, indexMetaData);
+                            aliasAndIndexLookupTmp.put(aliasMetaData.getAlias(), aliasOrIndex);
+                        } else if (aliasOrIndex instanceof AliasOrIndex.Alias) {
+                            AliasOrIndex.Alias alias = (AliasOrIndex.Alias) aliasOrIndex;
+                            alias.addIndex(indexMetaData);
+                        } else if (aliasOrIndex instanceof AliasOrIndex.Index) {
+                            AliasOrIndex.Index index = (AliasOrIndex.Index) aliasOrIndex;
+                            throw new IllegalStateException("index and alias names need to be unique, but alias [" + aliasMetaData.getAlias() + "] and index [" + index.getIndex().getIndex() + "] have the same name");
+                        } else {
+                            throw new IllegalStateException("unexpected alias [" + aliasMetaData.getAlias() + "][" + aliasOrIndex + "]");
+                        }
+                    }
+                }
 //        for(Map.Entry<String, MapDifference.ValueDifference<AliasOrIndex>> difference: Maps.difference(aliasOrIndexMap, aliasAndIndexLookupTmp).entriesDiffering().entrySet()) {
 //            AliasOrIndex updatedValue = difference.getValue().rightValue();
 //            if (updatedValue == null) {
@@ -187,45 +194,64 @@ public class IndexNameExpressionResolver extends AbstractComponent {
 //            }
 //        }
 
-            // wat
-            if (!aliasAndIndexLookupTmp.equals(aliasOrIndexMap)) {
-                for(Map.Entry<String, AliasOrIndex> aliasAndIndexUpdate : aliasAndIndexLookupTmp.entrySet()) {
-                    // TODO: can we make this even smarter by checking whether an update is "real" or not?
-                    aliasOrIndexMap.put(aliasAndIndexUpdate.getKey(), aliasAndIndexUpdate.getValue());
+                // wat
+//                if (!aliasAndIndexLookupTmp.equals(aliasOrIndexMap)) {
+
+                // remove first, since the comparison is based on an unmodified set
+//                Set<String> missing = Sets.difference(aliasOrIndexMap.keySet(), aliasAndIndexLookupTmp.keySet());
+//                for (String toRemove : missing) {
+//                    aliasOrIndexMap.remove(toRemove);
+//                }
+                    for (Map.Entry<String, AliasOrIndex> aliasAndIndexUpdate : aliasAndIndexLookupTmp.entrySet()) {
+                        // TODO: can we make this even smarter by checking whether an update is "real" or not?
+                        aliasOrIndexMap.put(aliasAndIndexUpdate.getKey(), aliasAndIndexUpdate.getValue());
+                    }
+
+
+//                System.out.println("removals[" + removals + "]");
+                if (removals != null) {
+                    for (String removal : removals) {
+                        AliasOrIndex index = aliasOrIndexMap.get(removal);
+//                    if (index != null) {
+                        for (IndexMetaData indexRemovals : index.getIndices()) {
+                            for (ObjectCursor<AliasMetaData> alias : indexRemovals.getAliases().values()) {
+                                aliasOrIndexMap.remove(alias.value.getAlias());
+                            }
+                        }
+                        aliasOrIndexMap.remove(removal);
+//                    }
+                    }
                 }
-                Set<String> missing = Sets.difference(aliasOrIndexMap.keySet(), aliasAndIndexLookupTmp.keySet());
-                for(String toRemove : missing) {
-                    aliasOrIndexMap.remove(toRemove);
-                }
-            }
+//                }
 
 //            SortedMap<String, AliasOrIndex> aliasOrIndexMapSorted = new TreeMap<>(aliasOrIndexMap);
+//                System.out.println("final metadata[" + aliasOrIndexMap + " ]");
+//                System.out.println("-----------------------------");
 
-            return new MetaDataBits(Collections.unmodifiableSortedMap(aliasOrIndexMap), allIndices, allOpenIndices, allClosedIndices);
-        } else {
-            List<String> allIndicesLst = new ArrayList<>();
-            List<String> allOpenIndicesLst = new ArrayList<>();
-            List<String> allClosedIndicesLst = new ArrayList<>();
-            for (ObjectCursor<IndexMetaData> cursor : indicesDelta.values()) {
-                IndexMetaData indexMetaData = cursor.value;
+                return new MetaDataBits(Collections.unmodifiableSortedMap(aliasOrIndexMap), allIndices, allOpenIndices, allClosedIndices);
+            } else {
 
-                allIndicesLst.add(indexMetaData.getIndex());
-                if (indexMetaData.getState() == IndexMetaData.State.OPEN) {
-                    allOpenIndicesLst.add(indexMetaData.getIndex());
-                } else if (indexMetaData.getState() == IndexMetaData.State.CLOSE) {
-                    allClosedIndicesLst.add(indexMetaData.getIndex());
+                // did not see any updates, but also need to compare for absence, which means an index was deleted
+                if (removals != null) {
+                    for (String removal : removals) {
+                        AliasOrIndex index = aliasOrIndexMap.get(removal);
+//                        if (index != null) {
+                            for (IndexMetaData indexRemovals : index.getIndices()) {
+                                for (ObjectCursor<AliasMetaData> alias : indexRemovals.getAliases().values()) {
+                                    aliasOrIndexMap.remove(alias.value.getAlias());
+                                }
+                            }
+                            aliasOrIndexMap.remove(removal);
+//                        }
+                    }
                 }
-            }
-            allIndices = allIndicesLst.toArray(new String[allIndicesLst.size()]);
-            allOpenIndices = allOpenIndicesLst.toArray(new String[allOpenIndicesLst.size()]);
-            allClosedIndices = allClosedIndicesLst.toArray(new String[allClosedIndicesLst.size()]);
 
-            for(String removal : removals) {
-                aliasOrIndexMap.remove(removal);
-            }
+//                System.out.println("final metadata[" + aliasOrIndexMap + " ]");
+//                System.out.println("-----------------------------");
 
-            return new MetaDataBits(Collections.unmodifiableSortedMap(aliasOrIndexMap), allIndices, allOpenIndices, allClosedIndices);
-        }
+                return new MetaDataBits(Collections.unmodifiableSortedMap(aliasOrIndexMap), allIndices, allOpenIndices, allClosedIndices);
+            }
+//        }
     }
 
     /**
@@ -274,81 +300,95 @@ public class IndexNameExpressionResolver extends AbstractComponent {
     }
 
     String[] concreteIndices(Context context, String... indexExpressions) {
-        if (indexExpressions == null || indexExpressions.length == 0) {
-            indexExpressions = new String[]{MetaData.ALL};
-        }
-        MetaData metaData = context.getState().metaData();
-        IndicesOptions options = context.getOptions();
-        boolean failClosed = options.forbidClosedIndices() && options.ignoreUnavailable() == false;
-        boolean failNoIndices = options.ignoreUnavailable() == false;
-        // If only one index is specified then whether we fail a request if an index is missing depends on the allow_no_indices
-        // option. At some point we should change this, because there shouldn't be a reason why whether a single index
-        // or multiple indices are specified yield different behaviour.
-        if (indexExpressions.length == 1) {
-            failNoIndices = options.allowNoIndices() == false;
-        }
-
-        List<String> expressions = Arrays.asList(indexExpressions);
-        for (ExpressionResolver expressionResolver : expressionResolvers) {
-            expressions = expressionResolver.resolve(context, expressions);
-        }
-
-        if (expressions.isEmpty()) {
-            if (!options.allowNoIndices()) {
-                IndexNotFoundException infe = new IndexNotFoundException((String)null);
-                infe.setResources("index_expression", indexExpressions);
-                throw infe;
-            } else {
-                return Strings.EMPTY_ARRAY;
+        synchronized (lock) {
+            if (indexExpressions == null || indexExpressions.length == 0) {
+                indexExpressions = new String[] { MetaData.ALL };
             }
-        }
+            MetaData metaData = context.getState().metaData();
+            IndicesOptions options = context.getOptions();
+            boolean failClosed = options.forbidClosedIndices() && options.ignoreUnavailable() == false;
+            boolean failNoIndices = options.ignoreUnavailable() == false;
+            // If only one index is specified then whether we fail a request if an index is missing depends on the allow_no_indices
+            // option. At some point we should change this, because there shouldn't be a reason why whether a single index
+            // or multiple indices are specified yield different behaviour.
+            if (indexExpressions.length == 1) {
+                failNoIndices = options.allowNoIndices() == false;
+            }
 
-        final Set<String> concreteIndices = new HashSet<>(expressions.size());
-        for (String expression : expressions) {
-            AliasOrIndex aliasOrIndex = metaData.getAliasAndIndexLookup().get(expression);
-            if (aliasOrIndex == null) {
-                if (failNoIndices) {
-                    IndexNotFoundException infe = new IndexNotFoundException(expression);
-                    infe.setResources("index_expression", expression);
+            List<String> expressions = Arrays.asList(indexExpressions);
+            for (ExpressionResolver expressionResolver : expressionResolvers) {
+                expressions = expressionResolver.resolve(context, expressions);
+            }
+
+//            System.out.println("expressions: " + expressions);
+
+            if (expressions.isEmpty()) {
+                if (!options.allowNoIndices()) {
+                    IndexNotFoundException infe = new IndexNotFoundException((String) null);
+                    infe.setResources("index_expression", indexExpressions);
                     throw infe;
                 } else {
-                    continue;
+                    return Strings.EMPTY_ARRAY;
                 }
             }
 
-            Collection<IndexMetaData> resolvedIndices = aliasOrIndex.getIndices();
-            if (resolvedIndices.size() > 1 && !options.allowAliasesToMultipleIndices()) {
-                String[] indexNames = new String[resolvedIndices.size()];
-                int i = 0;
-                for (IndexMetaData indexMetaData : resolvedIndices) {
-                    indexNames[i++] = indexMetaData.getIndex();
-                }
-                throw new IllegalArgumentException("Alias [" + expression + "] has more than one indices associated with it [" + Arrays.toString(indexNames) + "], can't execute a single index op");
-            }
+            final Set<String> concreteIndices = new HashSet<>(expressions.size());
+            for (String expression : expressions) {
+//                SortedMap<String, AliasOrIndex> indexLookup = metaData.getAliasAndIndexLookup();
+//                AliasOrIndex aliasOrIndex = indexLookup.get(expression);
+            AliasOrIndex aliasOrIndex = getAliasAndIndexLookup().get(expression);
 
-            for (IndexMetaData index : resolvedIndices) {
-                if (index.getState() == IndexMetaData.State.CLOSE) {
-                    if (failClosed) {
-                        throw new IndexClosedException(new Index(index.getIndex()));
+                if (aliasOrIndex == null) {
+//                    System.out.println("for expression[" + expression + "], found no index, metadata was[" + indexLookup + "]");
+                    if (failNoIndices) {
+                        IndexNotFoundException infe = new IndexNotFoundException(expression);
+                        infe.setResources("index_expression", expression);
+                        throw infe;
                     } else {
-                        if (options.forbidClosedIndices() == false) {
-                            concreteIndices.add(index.getIndex());
-                        }
+                        continue;
                     }
-                } else if (index.getState() == IndexMetaData.State.OPEN) {
-                    concreteIndices.add(index.getIndex());
                 } else {
-                    throw new IllegalStateException("index state [" + index.getState() + "] not supported");
+//                    System.out.println("for expression[" + expression + "], found index[" + aliasOrIndex.getIndices().get(0).getIndex() + "], metadata was[" + indexLookup + "]");
+                }
+
+                Collection<IndexMetaData> resolvedIndices = aliasOrIndex.getIndices();
+                if (resolvedIndices.size() > 1 && !options.allowAliasesToMultipleIndices()) {
+                    String[] indexNames = new String[resolvedIndices.size()];
+                    int i = 0;
+                    for (IndexMetaData indexMetaData : resolvedIndices) {
+                        indexNames[i++] = indexMetaData.getIndex();
+                    }
+                    throw new IllegalArgumentException("Alias [" + expression + "] has more than one indices associated with it [" + Arrays.toString(indexNames) + "], can't execute a single index op");
+                }
+
+                for (IndexMetaData index : resolvedIndices) {
+
+//                    System.out.println("index[" + index.getIndex() + "]; state[" + index.getState() + "]; forbid closed[" + options.forbidClosedIndices() + "]");
+
+                    if (index.getState() == IndexMetaData.State.CLOSE) {
+                        if (failClosed) {
+                            throw new IndexClosedException(new Index(index.getIndex()));
+                        } else {
+                            if (options.forbidClosedIndices() == false) {
+//                                System.out.println("adding concrete index[" + index.getIndex() + "]");
+                                concreteIndices.add(index.getIndex());
+                            }
+                        }
+                    } else if (index.getState() == IndexMetaData.State.OPEN) {
+                        concreteIndices.add(index.getIndex());
+                    } else {
+                        throw new IllegalStateException("index state [" + index.getState() + "] not supported");
+                    }
                 }
             }
-        }
 
-        if (options.allowNoIndices() == false && concreteIndices.isEmpty()) {
-            IndexNotFoundException infe = new IndexNotFoundException((String)null);
-            infe.setResources("index_expression", indexExpressions);
-            throw infe;
+            if (options.allowNoIndices() == false && concreteIndices.isEmpty()) {
+                IndexNotFoundException infe = new IndexNotFoundException((String) null);
+                infe.setResources("index_expression", indexExpressions);
+                throw infe;
+            }
+            return concreteIndices.toArray(new String[concreteIndices.size()]);
         }
-        return concreteIndices.toArray(new String[concreteIndices.size()]);
     }
 
     /**
@@ -378,7 +418,8 @@ public class IndexNameExpressionResolver extends AbstractComponent {
     public boolean hasIndexOrAlias(String aliasOrIndex, ClusterState state) {
         Context context = new Context(state, IndicesOptions.lenientExpandOpen());
         String resolvedAliasOrIndex = dateMathExpressionResolver.resolveExpression(aliasOrIndex, context);
-        return state.metaData().getAliasAndIndexLookup().containsKey(resolvedAliasOrIndex);
+        return getAliasAndIndexLookup().containsKey(resolvedAliasOrIndex);
+//        return state.metaData().getAliasAndIndexLookup().containsKey(resolvedAliasOrIndex);
     }
 
     /**
@@ -410,7 +451,8 @@ public class IndexNameExpressionResolver extends AbstractComponent {
         // optimize for the most common single index/alias scenario
         if (resolvedExpressions.size() == 1) {
             String alias = resolvedExpressions.get(0);
-            IndexMetaData indexMetaData = state.metaData().getIndices().get(index);
+            IndexMetaData indexMetaData = indicesCurrent.get(index);
+//            IndexMetaData indexMetaData = state.metaData().getIndices().get(index);
             if (indexMetaData == null) {
                 // Shouldn't happen
                 throw new IndexNotFoundException(index);
@@ -428,7 +470,8 @@ public class IndexNameExpressionResolver extends AbstractComponent {
                 return null;
             }
 
-            IndexMetaData indexMetaData = state.metaData().getIndices().get(index);
+            IndexMetaData indexMetaData = indicesCurrent.get(index);
+//            IndexMetaData indexMetaData = state.metaData().getIndices().get(index);
             if (indexMetaData == null) {
                 // Shouldn't happen
                 throw new IndexNotFoundException(index);
@@ -483,6 +526,7 @@ public class IndexNameExpressionResolver extends AbstractComponent {
         }
 
         for (String expression : resolvedExpressions) {
+//            AliasOrIndex aliasOrIndex = getAliasAndIndexLookup().get(expression);
             AliasOrIndex aliasOrIndex = state.metaData().getAliasAndIndexLookup().get(expression);
             if (aliasOrIndex != null && aliasOrIndex.isAlias()) {
                 AliasOrIndex.Alias alias = (AliasOrIndex.Alias) aliasOrIndex;
@@ -559,6 +603,7 @@ public class IndexNameExpressionResolver extends AbstractComponent {
             Set<String> r = Strings.splitStringByCommaToSet(routing);
             Map<String, Set<String>> routings = newHashMap();
             String[] concreteIndices = metaData.concreteAllIndices();
+//            String[] concreteIndices = IndexNameExpressionResolver.concreteAllIndices();
             for (String index : concreteIndices) {
                 routings.put(index, r);
             }
@@ -598,7 +643,7 @@ public class IndexNameExpressionResolver extends AbstractComponent {
      */
     boolean isPatternMatchingAllIndices(MetaData metaData, String[] indicesOrAliases, String[] concreteIndices) {
         // if we end up matching on all indices, check, if its a wildcard parameter, or a "-something" structure
-        if (concreteIndices.length == metaData.concreteAllIndices().length && indicesOrAliases.length > 0) {
+        if (concreteIndices.length == IndexNameExpressionResolver.concreteAllIndices().length && indicesOrAliases.length > 0) {
 
             //we might have something like /-test1,+test1 that would identify all indices
             //or something like /-test1 with test1 index missing and IndicesOptions.lenient()
@@ -691,10 +736,14 @@ public class IndexNameExpressionResolver extends AbstractComponent {
 
             if (expressions.isEmpty() || (expressions.size() == 1 && (MetaData.ALL.equals(expressions.get(0)) || Regex.isMatchAllPattern(expressions.get(0))))) {
                 if (options.expandWildcardsOpen() && options.expandWildcardsClosed()) {
+//                    return Arrays.asList(IndexNameExpressionResolver.concreteAllIndices());
+//                    return Arrays.asList(IndexNameExpressionResolver.concreteAllIndices());
                     return Arrays.asList(metaData.concreteAllIndices());
                 } else if (options.expandWildcardsOpen()) {
+//                    return Arrays.asList(IndexNameExpressionResolver.concreteAllOpenIndices());
                     return Arrays.asList(metaData.concreteAllOpenIndices());
                 } else if (options.expandWildcardsClosed()) {
+//                    return Arrays.asList(IndexNameExpressionResolver.concreteAllClosedIndices());
                     return Arrays.asList(metaData.concreteAllClosedIndices());
                 } else {
                     return Collections.emptyList();
@@ -705,6 +754,7 @@ public class IndexNameExpressionResolver extends AbstractComponent {
             boolean wildcardSeen = false;
             for (int i = 0; i < expressions.size(); i++) {
                 String expression = expressions.get(i);
+//                if (getAliasAndIndexLookup().containsKey(expression)) {
                 if (metaData.getAliasAndIndexLookup().containsKey(expression)) {
                     if (result != null) {
                         result.add(expression);
@@ -822,6 +872,22 @@ public class IndexNameExpressionResolver extends AbstractComponent {
             }
             return new ArrayList<>(result);
         }
+    }
+
+    private static SortedMap<String, AliasOrIndex> getAliasAndIndexLookup() {
+        return IndexNameExpressionResolver.aliasOrIndexMap;
+    }
+
+    private static String[] concreteAllOpenIndices() {
+        return IndexNameExpressionResolver.allOpenIndices;
+    }
+
+    private static String[] concreteAllClosedIndices() {
+        return IndexNameExpressionResolver.allClosedIndices;
+    }
+
+    public static String[] concreteAllIndices() {
+        return IndexNameExpressionResolver.allIndices;
     }
 
     final static class DateMathExpressionResolver implements ExpressionResolver {

@@ -214,6 +214,7 @@ public class OperationRouting extends AbstractComponent {
 
     @SuppressForbidden(reason = "Math#abs is trappy")
     private int generateShardId(ClusterState clusterState, String index, String type, String id, @Nullable String routing) {
+//        IndexMetaData indexMetaData = clusterState.metaData().getAliasAndIndexLookup().get(index).getIndices().get(0);
         IndexMetaData indexMetaData = clusterState.metaData().index(index);
         if (indexMetaData == null) {
             throw new IndexNotFoundException(index);

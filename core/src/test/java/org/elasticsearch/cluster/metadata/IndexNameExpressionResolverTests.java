@@ -26,8 +26,8 @@ import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.IndexMetaData.State;
 import org.elasticsearch.common.Strings;
-import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.indices.IndexClosedException;
 import org.elasticsearch.test.ESTestCase;
 import org.junit.Test;
@@ -37,7 +37,13 @@ import java.util.Collections;
 import java.util.HashSet;
 
 import static com.google.common.collect.Sets.newHashSet;
-import static org.hamcrest.Matchers.*;
+import static org.hamcrest.Matchers.arrayContaining;
+import static org.hamcrest.Matchers.arrayContainingInAnyOrder;
+import static org.hamcrest.Matchers.arrayWithSize;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.emptyArray;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.notNullValue;
 
 /**
  */
@@ -74,7 +80,7 @@ public class IndexNameExpressionResolverTests extends ESTestCase {
             assertThat(results, arrayContainingInAnyOrder("foofoo", "foobar"));
 
             results = indexNameExpressionResolver.concreteIndices(context, "foofoobar");
-            assertEquals(new HashSet<>(Arrays.asList("foo", "foobar")), 
+            assertEquals(new HashSet<>(Arrays.asList("foo", "foobar")),
                          new HashSet<>(Arrays.asList(results)));
 
             try {
@@ -161,7 +167,7 @@ public class IndexNameExpressionResolverTests extends ESTestCase {
 
             results = indexNameExpressionResolver.concreteIndices(context, "foofoobar");
             assertEquals(2, results.length);
-            assertEquals(new HashSet<>(Arrays.asList("foo", "foobar")), 
+            assertEquals(new HashSet<>(Arrays.asList("foo", "foobar")),
                          new HashSet<>(Arrays.asList(results)));
 
             results = indexNameExpressionResolver.concreteIndices(context, "foo", "bar");
@@ -814,6 +820,34 @@ public class IndexNameExpressionResolverTests extends ESTestCase {
         String[] concreteIndices = new String[]{"index1", "index2", "index3"};
         MetaData metaData = metaDataBuilder(concreteIndices);
         assertThat(indexNameExpressionResolver.isPatternMatchingAllIndices(metaData, indicesOrAliases, concreteIndices), equalTo(true));
+    }
+
+    @Test
+    public void testIndicesReduced() {
+        MetaData metaData1 = metaDataBuilder("test1");
+        MetaData metaData1point5 = metaDataBuilder("test1");
+
+        System.out.println("[--- 1 " + metaData1.getAliasAndIndexLookup() + " ---]");
+        System.out.println("[--- 1.5 " + metaData1point5.getAliasAndIndexLookup() + " ---]");
+
+        MetaData metaData2 = metaDataBuilder("test1", "test2");
+        MetaData metaData2point5 = metaDataBuilder("test1", "test2");
+
+        System.out.println("[--- 2 " + metaData2.getAliasAndIndexLookup() + " ---]");
+        System.out.println("[--- 2.5 " + metaData2point5.getAliasAndIndexLookup() + " ---]");
+
+        MetaData metaData3 = metaDataBuilder("test1");
+        MetaData metaData3point5 = metaDataBuilder("test1");
+
+        System.out.println("[--- 3 " + metaData3.getAliasAndIndexLookup() + " ---]");
+        System.out.println("[--- 3.5 " + metaData3point5.getAliasAndIndexLookup() + " ---]");
+
+        System.out.println();
+        System.out.println();
+        System.out.println("[--- 1 " + metaData1.getAliasAndIndexLookup() + " ---]");
+        System.out.println("[--- 1.5 " + metaData1point5.getAliasAndIndexLookup() + " ---]");
+        System.out.println("[--- 3 " + metaData3.getAliasAndIndexLookup() + " ---]");
+        System.out.println("[--- 3.5 " + metaData3point5.getAliasAndIndexLookup() + " ---]");
     }
 
     @Test

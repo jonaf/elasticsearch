@@ -82,64 +82,68 @@ public class MetaDataDeleteIndexService extends AbstractComponent {
 
             @Override
             public ClusterState execute(final ClusterState currentState) {
-                RoutingTable.Builder routingTableBuilder = RoutingTable.builder(currentState.routingTable());
-                MetaData.Builder metaDataBuilder = MetaData.builder(currentState.metaData());
-                ClusterBlocks.Builder clusterBlocksBuilder = ClusterBlocks.builder().blocks(currentState.blocks());
+                synchronized (IndexNameExpressionResolver.lock) {
+                    RoutingTable.Builder routingTableBuilder = RoutingTable.builder(currentState.routingTable());
+                    MetaData.Builder metaDataBuilder = MetaData.builder(currentState.metaData());
+                    ClusterBlocks.Builder clusterBlocksBuilder = ClusterBlocks.builder().blocks(currentState.blocks());
 
-                for (final String index: indices) {
-                    if (!currentState.metaData().hasConcreteIndex(index)) {
-                        throw new IndexNotFoundException(index);
+                    for (final String index : indices) {
+                        if (!currentState.metaData().hasConcreteIndex(index)) {
+                            throw new IndexNotFoundException(index);
+                        }
+
+                        logger.debug("[{}] deleting index", index);
+//                        System.out.println("[" + index + "] deleting index");
+
+                        routingTableBuilder.remove(index);
+                        clusterBlocksBuilder.removeIndexBlocks(index);
+                        metaDataBuilder.remove(index);
                     }
+                    // wait for events from all nodes that it has been removed from their respective metadata...
+                    int count = currentState.nodes().size();
+                    // add the notifications that the store was deleted from *data* nodes
+                    count += currentState.nodes().dataNodes().size();
+                    final AtomicInteger counter = new AtomicInteger(count * indices.size());
 
-                    logger.debug("[{}] deleting index", index);
-
-                    routingTableBuilder.remove(index);
-                    clusterBlocksBuilder.removeIndexBlocks(index);
-                    metaDataBuilder.remove(index);
-                }
-                // wait for events from all nodes that it has been removed from their respective metadata...
-                int count = currentState.nodes().size();
-                // add the notifications that the store was deleted from *data* nodes
-                count += currentState.nodes().dataNodes().size();
-                final AtomicInteger counter = new AtomicInteger(count * indices.size());
-
-                // this listener will be notified once we get back a notification based on the cluster state change below.
-                final NodeIndexDeletedAction.Listener nodeIndexDeleteListener = new NodeIndexDeletedAction.Listener() {
-                    @Override
-                    public void onNodeIndexDeleted(String deleted, String nodeId) {
-                        if (indices.contains(deleted)) {
-                            if (counter.decrementAndGet() == 0) {
-                                listener.onResponse(new Response(true));
-                                nodeIndexDeletedAction.remove(this);
+                    // this listener will be notified once we get back a notification based on the cluster state change below.
+                    final NodeIndexDeletedAction.Listener nodeIndexDeleteListener = new NodeIndexDeletedAction.Listener() {
+                        @Override
+                        public void onNodeIndexDeleted(String deleted, String nodeId) {
+                            if (indices.contains(deleted)) {
+                                if (counter.decrementAndGet() == 0) {
+                                    listener.onResponse(new Response(true));
+                                    nodeIndexDeletedAction.remove(this);
+                                }
                             }
                         }
-                    }
 
-                    @Override
-                    public void onNodeIndexStoreDeleted(String deleted, String nodeId) {
-                        if (indices.contains(deleted)) {
-                            if (counter.decrementAndGet() == 0) {
-                                listener.onResponse(new Response(true));
-                                nodeIndexDeletedAction.remove(this);
+                        @Override
+                        public void onNodeIndexStoreDeleted(String deleted, String nodeId) {
+                            if (indices.contains(deleted)) {
+                                if (counter.decrementAndGet() == 0) {
+                                    listener.onResponse(new Response(true));
+                                    nodeIndexDeletedAction.remove(this);
+                                }
                             }
                         }
-                    }
-                };
-                nodeIndexDeletedAction.add(nodeIndexDeleteListener);
-                listener.future = threadPool.schedule(request.timeout, ThreadPool.Names.SAME, new Runnable() {
-                    @Override
-                    public void run() {
-                        listener.onResponse(new Response(false));
-                        nodeIndexDeletedAction.remove(nodeIndexDeleteListener);
-                    }
-                });
+                    };
+                    nodeIndexDeletedAction.add(nodeIndexDeleteListener);
+                    listener.future = threadPool.schedule(request.timeout, ThreadPool.Names.SAME, new Runnable() {
+                        @Override
+                        public void run() {
+                            listener.onResponse(new Response(false));
+                            nodeIndexDeletedAction.remove(nodeIndexDeleteListener);
+                        }
+                    });
 
-                MetaData newMetaData = metaDataBuilder.build();
-                ClusterBlocks blocks = clusterBlocksBuilder.build();
-                RoutingAllocation.Result routingResult = allocationService.reroute(
+                    MetaData newMetaData = metaDataBuilder.build();
+                    ClusterBlocks blocks = clusterBlocksBuilder.build();
+                    RoutingAllocation.Result routingResult = allocationService.reroute(
                         ClusterState.builder(currentState).routingTable(routingTableBuilder.build()).metaData(newMetaData).build(),
                         "deleted indices [" + indices + "]");
-                return ClusterState.builder(currentState).routingResult(routingResult).metaData(newMetaData).blocks(blocks).build();
+//                    System.out.println("deleted indices [" + indices + "]");
+                    return ClusterState.builder(currentState).routingResult(routingResult).metaData(newMetaData).blocks(blocks).build();
+                }
             }
 
             @Override

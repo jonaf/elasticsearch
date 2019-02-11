@@ -154,7 +154,7 @@ public class MetaData implements Iterable<IndexMetaData>, Diffable<MetaData>, Fr
     private final SortedMap<String, AliasOrIndex> aliasAndIndexLookup;
 
     @SuppressWarnings("unchecked")
-    MetaData(String clusterUUID, long version, Settings transientSettings, Settings persistentSettings, ImmutableOpenMap<String, IndexMetaData> indices, ImmutableOpenMap<String, IndexTemplateMetaData> templates, ImmutableOpenMap<String, Custom> customs) {
+    MetaData(String clusterUUID, long version, Settings transientSettings, Settings persistentSettings, ImmutableOpenMap<String, IndexMetaData> indices, ImmutableOpenMap<String, IndexTemplateMetaData> templates, ImmutableOpenMap<String, Custom> customs, SortedMap<String, AliasOrIndex> aliasAndIndexLookup, String[] allIndices, String[] allOpenIndices, String[] allClosedIndices) {
         this.clusterUUID = clusterUUID;
         this.version = version;
         this.transientSettings = transientSettings;
@@ -172,12 +172,10 @@ public class MetaData implements Iterable<IndexMetaData>, Diffable<MetaData>, Fr
         this.totalNumberOfShards = totalNumberOfShards;
         this.numberOfShards = numberOfShards;
 
-        IndexNameExpressionResolver.MetaDataBits bits = IndexNameExpressionResolver.updateAndGetAliasOrIndexMap(indices);
-
-        this.allIndices = bits.getAllIndices();
-        this.allOpenIndices = bits.getAllOpenIndices();
-        this.allClosedIndices = bits.getAllClosedIndices();
-        this.aliasAndIndexLookup = bits.getAliasOrIndexMap();
+        this.aliasAndIndexLookup = aliasAndIndexLookup;
+        this.allIndices = allIndices;
+        this.allOpenIndices = allOpenIndices;
+        this.allClosedIndices = allClosedIndices;
     }
 
     public long version() {
@@ -468,7 +466,18 @@ public class MetaData implements Iterable<IndexMetaData>, Diffable<MetaData>, Fr
     }
 
     public IndexMetaData index(String index) {
-        return indices.get(index);
+        final AliasOrIndex maybeIndices = getAliasAndIndexLookup().get(index);
+        if(maybeIndices != null) {
+            final List<IndexMetaData> existingIndex = maybeIndices.getIndices();
+        if(existingIndex.get(0) != null) {
+            return existingIndex.get(0);
+        } else {
+            return null;
+        }
+        } else {
+            return null;
+        }
+//        return indices.get(index);
     }
 
     public ImmutableOpenMap<String, IndexMetaData> indices() {
@@ -822,7 +831,11 @@ public class MetaData implements Iterable<IndexMetaData>, Diffable<MetaData>, Fr
                     MoreObjects.firstNonNull(newPersistentSettings, metaData.persistentSettings()),
                     metaData.getIndices(),
                     MoreObjects.firstNonNull(templates, metaData.getTemplates()),
-                    metaData.getCustoms());
+                    metaData.getCustoms(),
+                    metaData.getAliasAndIndexLookup(),
+                    metaData.getConcreteAllIndices(),
+                    metaData.getConcreteAllOpenIndices(),
+                    metaData.getConcreteAllClosedIndices());
         } else {
             // No changes:
             return metaData;
@@ -1037,7 +1050,20 @@ public class MetaData implements Iterable<IndexMetaData>, Diffable<MetaData>, Fr
         }
 
         public MetaData build() {
-            return new MetaData(clusterUUID, version, transientSettings, persistentSettings, indices.build(), templates.build(), customs.build());
+//            synchronized (IndexNameExpressionResolver.lock) {
+                final ImmutableOpenMap<String, IndexMetaData> indicesMetadata = indices.build();
+//                final ImmutableOpenMap<String, IndexMetaData> indicesMetadataCloned = new ImmutableOpenMap.Builder<>(indicesMetadata).build();
+                final IndexNameExpressionResolver.MetaDataBits bits = IndexNameExpressionResolver.updateAndGetAliasOrIndexMap(indicesMetadata);
+
+                // TODO: not needed copy?
+                String[] allIndices = bits.getAllIndices().clone();
+                String[] allOpenIndices = bits.getAllOpenIndices().clone();
+                String[] allClosedIndices = bits.getAllClosedIndices().clone();
+                SortedMap<String, AliasOrIndex> aliasAndIndexLookup = Collections.unmodifiableSortedMap(bits.getAliasOrIndexMap());
+//                SortedMap<String, AliasOrIndex> aliasAndIndexLookup = Collections.unmodifiableSortedMap(new TreeMap<>(bits.getAliasOrIndexMap()));
+                return new MetaData(clusterUUID, version, transientSettings, persistentSettings, indicesMetadata, templates.build(), customs.build(), aliasAndIndexLookup, allIndices, allOpenIndices, allClosedIndices);
+//            }
+
         }
 
         public static String toXContent(MetaData metaData) throws IOException {

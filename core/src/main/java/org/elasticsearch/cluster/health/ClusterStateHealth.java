@@ -21,6 +21,7 @@ package org.elasticsearch.cluster.health;
 import org.elasticsearch.cluster.ClusterName;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.IndexMetaData;
+import org.elasticsearch.cluster.metadata.IndexNameExpressionResolver;
 import org.elasticsearch.cluster.metadata.MetaData;
 import org.elasticsearch.cluster.routing.IndexRoutingTable;
 import org.elasticsearch.cluster.routing.RoutingTable;
@@ -94,7 +95,7 @@ public final class ClusterStateHealth implements Iterable<ClusterIndexHealth>, S
      * @param clusterState The current cluster state. Must not be null.
      */
     public ClusterStateHealth(ClusterState clusterState) {
-        this(clusterState, clusterState.metaData().concreteAllIndices());
+        this(clusterState, IndexNameExpressionResolver.concreteAllIndices());
     }
 
     /**

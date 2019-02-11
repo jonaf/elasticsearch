@@ -78,6 +78,7 @@ public class TransportDeleteIndexAction extends TransportMasterNodeAction<Delete
     @Override
     protected void masterOperation(final DeleteIndexRequest request, final ClusterState state, final ActionListener<DeleteIndexResponse> listener) {
         final String[] concreteIndices = indexNameExpressionResolver.concreteIndices(state, request);
+//        System.out.println("found concrete indices [" + asList(concreteIndices) + "]");
         if (concreteIndices.length == 0) {
             listener.onResponse(new DeleteIndexResponse(true));
             return;
