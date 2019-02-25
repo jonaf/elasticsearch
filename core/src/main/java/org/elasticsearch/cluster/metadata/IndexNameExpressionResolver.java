@@ -49,6 +49,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.Callable;
 
 import static com.google.common.collect.Maps.filterEntries;
@@ -612,7 +613,7 @@ public class IndexNameExpressionResolver extends AbstractComponent {
                     char[] toPrefixCharArr = fromPrefix.toCharArray();
                     toPrefixCharArr[toPrefixCharArr.length - 1]++;
                     String toPrefix = new String(toPrefixCharArr);
-                    matches = metaData.getAliasAndIndexLookup().subMap(fromPrefix, toPrefix);
+                    matches = new TreeMap<>(metaData.getAliasAndIndexLookup()).subMap(fromPrefix, toPrefix);
                 } else {
                     // Other wildcard expressions:
                     final String pattern = expression;
