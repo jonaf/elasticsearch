@@ -23,7 +23,12 @@ import com.carrotsearch.hppc.cursors.ObjectCursor;
 import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.admin.indices.mapping.put.PutMappingClusterStateUpdateRequest;
-import org.elasticsearch.cluster.*;
+import org.elasticsearch.cluster.AbstractAckedClusterStateTaskListener;
+import org.elasticsearch.cluster.AbstractClusterStateTaskListener;
+import org.elasticsearch.cluster.BasicClusterStateTaskConfig;
+import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.ClusterStateTaskExecutor;
 import org.elasticsearch.cluster.ack.ClusterStateUpdateResponse;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.common.Nullable;
@@ -37,13 +42,17 @@ import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.index.IndexService;
 import org.elasticsearch.index.mapper.DocumentMapper;
 import org.elasticsearch.index.mapper.MapperService;
-import org.elasticsearch.index.mapper.MergeMappingException;
 import org.elasticsearch.indices.IndicesService;
 import org.elasticsearch.indices.InvalidTypeNameException;
 import org.elasticsearch.percolator.PercolatorService;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Service responsible for submitting mapping changes
@@ -291,6 +300,7 @@ public class MetaDataMappingService extends AbstractComponent {
                 throw new InvalidTypeNameException("Document mapping type name can't start with '_'");
             }
             MetaData.Builder builder = MetaData.builder(currentState.metaData());
+            boolean updated = false;
             for (String index : request.indices()) {
                 // do the actual merge here on the master, and update the mapping source
                 IndexService indexService = indicesService.indexService(index);
@@ -310,6 +320,7 @@ public class MetaDataMappingService extends AbstractComponent {
                     if (existingSource.equals(updatedSource)) {
                         // same source, no changes, ignore it
                     } else {
+                        updated = true;
                         // use the merged mapping source
                         if (logger.isDebugEnabled()) {
                             logger.debug("[{}] update_mapping [{}] with source [{}]", index, mergedMapper.type(), updatedSource);
@@ -318,6 +329,7 @@ public class MetaDataMappingService extends AbstractComponent {
                         }
                     }
                 } else {
+                    updated = true;
                     if (logger.isDebugEnabled()) {
                         logger.debug("[{}] create_mapping [{}] with source [{}]", index, mappingType, updatedSource);
                     } else if (logger.isInfoEnabled()) {
@@ -338,7 +350,11 @@ public class MetaDataMappingService extends AbstractComponent {
                 builder.put(indexMetaDataBuilder);
             }
 
-            return ClusterState.builder(currentState).metaData(builder).build();
+            if (updated) {
+                return ClusterState.builder(currentState).metaData(builder).build();
+            } else {
+                return currentState;
+            }
         }
     }
 
